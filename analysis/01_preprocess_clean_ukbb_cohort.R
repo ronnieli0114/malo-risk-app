@@ -8,6 +8,8 @@ library(writexl)
 
 project_dir <- "/mnt/d/Projects/BFA"
 data_dir <- file.path(project_dir, "data")
+out_dir <- file.path(project_dir, "results")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
 # Path to raw data
 path_to_raw_csv <- file.path(data_dir, "2026-02-19_cohort_extract.csv")
@@ -568,6 +570,53 @@ data_clean <- data_clean %>%
     age_diabetes = ifelse(age_diabetes=='NaN', NA_real_, as.numeric(age_diabetes))
   ) %>%
   dplyr::select(-date_of_death_i0)
+
+#===============================================================================
+# Completeness of the six Clinical Model predictors BEFORE any exclusion
+# Denominators: (a) all participants in the extract; (b) participants meeting
+# >=1 inclusion criterion. Both are computed before the genotype merge,
+# the complete-case filter, and the FIB-4 / competing-liver-disease exclusions.
+#===============================================================================
+
+predictor_flags <- data_clean %>%
+  transmute(
+    meets_inclusion = coalesce(has_t2dm | has_complicated_obesity |
+                                 has_metabolic_syndrome | has_excess_alcohol, FALSE),
+    age                = !is.na(age),
+    sex                = sex %in% c("Male", "Female"),
+    bmi                = !is.na(bmi),
+    diabetes           = diabetes_dx %in% c("Yes", "No"),
+    alcohol_grams_week = !is.na(alcohol_grams_week),
+    smoking            = smoking %in% c("Never", "Previous", "Current")
+  ) %>%
+  mutate(all_six = age & sex & bmi & diabetes & alcohol_grams_week & smoking)
+
+completeness_vars <- c(age = "Age", sex = "Sex", bmi = "BMI",
+                       diabetes = "Type 2 diabetes", alcohol_grams_week = "Alcohol intake",
+                       smoking = "Smoking status", all_six = "All six predictors")
+completeness_sources <- c(
+  "Field 21003", "Field 31", "Field 21001",
+  "Field 2443 answered Yes/No (doctor-diagnosed diabetes)",
+  "Fields 1568/1578/1588/1598/1608 (no 'Do not know'/'Prefer not to answer')",
+  "Field 20116 answered Never/Previous/Current",
+  "Complete for all of the above"
+)
+eligible_flags <- filter(predictor_flags, meets_inclusion)
+
+completeness_summary <- data.frame(
+  Predictor           = unname(completeness_vars),
+  Definition_complete = completeness_sources,
+  N_complete_all      = sapply(names(completeness_vars), function(v) sum(predictor_flags[[v]])),
+  Pct_complete_all    = sapply(names(completeness_vars), function(v) round(100 * mean(predictor_flags[[v]]), 2)),
+  N_complete_eligible = sapply(names(completeness_vars), function(v) sum(eligible_flags[[v]])),
+  Pct_complete_eligible = sapply(names(completeness_vars), function(v) round(100 * mean(eligible_flags[[v]]), 2)),
+  row.names = NULL
+)
+
+cat("\n=== CLINICAL MODEL PREDICTOR COMPLETENESS (before exclusions) ===\n")
+cat("All participants:", nrow(predictor_flags),
+    "| Meeting >=1 inclusion criterion:", nrow(eligible_flags), "\n")
+print(completeness_summary, row.names = FALSE)
 
 #===============================================================================
 # Incorporate genotype information (.raw files)
@@ -1269,13 +1318,14 @@ print(followup_summary, row.names = FALSE)
 # SAVE ALL FILES
 #=============================================
  
-summary_list <- list("inclusion" = inclusion_summary,
+summary_list <- list("predictor_completeness" = completeness_summary,
+                     "inclusion" = inclusion_summary,
                      "exclusion" = exclusion_summary,
                      "final_cohort" = final_summary,
                      "MALO" = malo_summary,
                      "competing_event" = competing_summary,
                      "follow_up" = followup_summary)
-write_xlsx(summary_list, file.path(data_dir, "BFA_cohort_summaries.xlsx"))
+write_xlsx(summary_list, file.path(out_dir, "01_cohort_summaries.xlsx"))
 write_feather(final_cohort_with_outcomes, file.path(data_dir, "BFA_principal_data.feather"))
 
 cat("=============== DONE ===============\n\n")
