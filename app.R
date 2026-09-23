@@ -61,6 +61,7 @@ library(bslib)
 #   $preprocessing list        BMI winsorising bounds, alcohol cap
 #   $xlevels       list        factor codings for sex / has_t2dm / smoking
 #   $input_range   list        training 1st–99th percentiles, for range warnings
+#   $vcov          num[6,6]    covariance of the coefficients (for risk CIs)
 #   $risk_cut_10y  num         median predicted 10-year risk in the cohort
 #   $cohort_summary, $cv_performance   aggregate metadata shown in the footer
 #   $predict_fn    function    CIF(t|x) = 1 - exp(-H0(t) * exp(x %*% beta))
@@ -85,24 +86,17 @@ message("Loaded ", model$model_name, " (created ", model$date_created, ")")
 # below to 100 * model$risk_cut_10y to switch to the cohort median instead.
 RISK_THRESHOLD_10Y <- 0.5
 
-# Reference ("counterfactual target") profile.  Every factor's contribution is
-# measured against this patient.  Values: age = midpoint of the training
-# 1st–99th percentile range; sex = the model's baseline level (male); and for
-# the four modifiable factors, the clinical target a clinician would aim for.
-REFERENCE <- list(
-  age                = 55,
-  sex                = "1",   # male — the reference level of the sex term
+# Optimal profile for the modifiable factors.  Each modifiable factor's
+# contribution is measured by moving it to its value here while the patient's
+# other factors — including age and sex, which are not modifiable and are held
+# at the patient's own values — stay where they are.
+OPTIMAL <- list(
   bmi                = 25,
   has_t2dm           = "0",
   alcohol_grams_week = 0,
   smoking_binary     = "0"
 )
-
-REFERENCE_TEXT <- "a 55-year-old man with BMI 25 kg/m², no type 2 diabetes, no alcohol intake and no current smoking"
-
-# Factors a clinician can act on.  Age and sex are excluded: they contribute to
-# the risk estimate but cannot be targets of advice.
-MODIFIABLE <- c("bmi", "has_t2dm", "alcohol_grams_week", "smoking_binary")
+MODIFIABLE <- names(OPTIMAL)
 
 VAR_LABELS <- c(
   age                = "Age",
@@ -111,15 +105,6 @@ VAR_LABELS <- c(
   has_t2dm           = "Type 2 diabetes",
   alcohol_grams_week = "Alcohol intake",
   smoking_binary     = "Smoking status"
-)
-
-# How to describe moving each factor to its reference value, in a sentence of
-# the form "<phrase> is projected to lower the 10-year risk from A% to B%".
-ACTION_PHRASE <- c(
-  bmi                = "Reducing BMI to 25 kg/m²",
-  has_t2dm           = "Absence of type 2 diabetes",
-  alcohol_grams_week = "Abstaining from alcohol",
-  smoking_binary     = "Stopping smoking"
 )
 
 # Human-readable rendering of a predictor value, for the contributions table.
@@ -154,30 +139,28 @@ fmt_pct <- function(x, suffix = "%") {
 #
 #     CIF(t | x) = 1 - exp(-H0(t) * exp(sum(beta_j * x_j)))
 #
-# Setting predictor j to a reference value ref_j and leaving the rest alone
-# multiplies the subdistribution hazard by exactly exp(beta_j * (x_j - ref_j)),
-# independently of the other predictors and of t.  So for each factor we
-# compute two numbers, both exact and both from one call to $predict_fn:
+# Setting modifiable predictor j to its optimal value opt_j and leaving the rest
+# alone (age and sex stay at the patient's own values) multiplies the
+# subdistribution hazard by exactly exp(beta_j * (x_j - opt_j)), independently
+# of the other predictors and of t.  So for each modifiable factor we compute
+# two numbers, both exact and both from one call to $predict_fn:
 #
-#   * risk multiple  — exp(beta_j * (x_j - ref_j)): the factor by which this
-#     patient's value of factor j multiplies their risk relative to the
-#     reference patient.  These multiply exactly: the product across all six
-#     factors is the patient's total risk multiple versus the reference.
-#     Recovered from the predictions as log(1-r_patient) / log(1-r_j), because
+#   * risk multiple  — exp(beta_j * (x_j - opt_j)): the factor by which this
+#     patient's value of factor j multiplies their risk relative to the same
+#     patient at the optimal value.  These multiply exactly: the product across
+#     the four modifiable factors is the patient's total risk multiple versus
+#     the same patient at the fully optimal profile.  Recovered from the
+#     predictions as log(1-r_patient) / log(1-r_j), because
 #     -log(1 - CIF) = H0(t) * exp(lp) and H0(t) cancels.
 #
 #   * delta  — r_patient - r_j: how many percentage points of this patient's
 #     absolute 10-year risk are attributable to factor j sitting where it does
-#     rather than at its reference value.  For the four modifiable factors the
-#     reference IS the clinical target, so this is the risk reduction that
-#     reaching that target would achieve, holding everything else fixed.
+#     rather than at its optimal value, i.e. the risk reduction that reaching
+#     the optimal value would achieve, holding everything else fixed.
 #
 # The deltas are not additive (absolute risk is a nonlinear function of the
 # linear predictor), which is why the table below reports them alongside the
-# multiples rather than as a decomposition that sums to the total.  Ranking by
-# delta is what identifies the principal driver: it answers "which single
-# factor is contributing the most absolute risk for this patient", which is the
-# question the SHAP panel was there to answer.
+# multiples rather than as a decomposition that sums to the total.
 #
 # Everything routes through model$predict_fn, so the app inherits the training
 # preprocessing (BMI winsorising, alcohol capping) for the counterfactual rows
@@ -203,12 +186,12 @@ effective_values <- function(model, patient) {
 }
 
 attribute_risk <- function(model, patient, time = 10) {
-  preds <- model$predictors
+  preds <- MODIFIABLE
 
-  # Row 1 is the patient; rows 2..7 are the patient with a single predictor
-  # moved to its reference value.  One predict_fn call covers all of them.
+  # Row 1 is the patient; rows 2..5 are the patient with a single modifiable
+  # predictor moved to its optimal value.  One predict_fn call covers all of them.
   nd <- patient[rep(1L, 1L + length(preds)), , drop = FALSE]
-  for (i in seq_along(preds)) nd[[preds[i]]][i + 1L] <- REFERENCE[[preds[i]]]
+  for (i in seq_along(preds)) nd[[preds[i]]][i + 1L] <- OPTIMAL[[preds[i]]]
 
   r     <- model$predict_fn(model, nd, times = time)[, 1]
   r_pat <- r[1]
@@ -226,17 +209,50 @@ attribute_risk <- function(model, patient, time = 10) {
                   txt <- fmt_value(v, eff$values[[v]])
                   if (isTRUE(eff$adjusted[[v]])) paste0(txt, "\u2020") else txt
                 }, character(1)),
-    ref_value = vapply(preds, function(v) fmt_value(v, REFERENCE[[v]]), character(1)),
-    # exp(beta_j * (x_j - ref_j)); > 1 raises risk, < 1 lowers it
+    opt_value = vapply(preds, function(v) fmt_value(v, OPTIMAL[[v]]), character(1)),
+    # exp(beta_j * (x_j - opt_j)); > 1 raises risk, < 1 lowers it
     multiple  = log1p(-r_pat) / log1p(-r_ref),
-    risk_if_ref = 100 * r_ref,
-    delta_pp    = 100 * (r_pat - r_ref),
-    modifiable  = preds %in% MODIFIABLE,
+    delta_pp  = 100 * (r_pat - r_ref),
     stringsAsFactors = FALSE,
     row.names = NULL
   )
 }
 
+
+# ── 4b.  Confidence intervals for the predicted risk ──────────────────────────
+#
+# The 95% CI propagates the sampling uncertainty of the coefficient vector
+# (model$vcov, the covariance matrix from the Fine-Gray fit) through the linear
+# predictor:  se(lp) = sqrt(x' V x),  lp ± z * se(lp),  then the same monotone
+# transform to the probability scale.  Since 1 - CIF = exp(-H0 * exp(lp)),
+# shifting lp by d gives  1 - CIF_new = (1 - CIF)^exp(d), so the bounds come
+# straight from the point estimate and H0 never has to be touched again.
+#
+# What it does NOT include: uncertainty in the baseline cumulative hazard H0(t).
+# The Fine-Gray fit (cmprsk::crr) returns H0 as a point estimate with no
+# variance, so it cannot be recovered from the deployed model.  With ~1,800
+# events H0 is estimated far more tightly than the coefficients, so this is a
+# small omission, but the interval is best read as a slightly optimistic one.
+# Nor does it capture model misspecification or performance in other cohorts.
+risk_ci <- function(model, patient, times = c(5, 10), level = 0.95) {
+  eff <- effective_values(model, patient)$values
+  nd  <- patient[1L, , drop = FALSE]
+  nd$bmi                <- eff$bmi
+  nd$alcohol_grams_week <- eff$alcohol_grams_week
+  for (v in names(model$xlevels))
+    nd[[v]] <- factor(as.character(nd[[v]]), levels = model$xlevels[[v]])
+
+  X <- model.matrix(reformulate(model$predictors), nd)[, names(model$coefficients),
+                                                       drop = FALSE]
+  stopifnot(identical(dim(model$vcov), rep(length(model$coefficients), 2L)))
+  se_lp <- sqrt(drop(X %*% model$vcov %*% t(X)))
+  z     <- qnorm(1 - (1 - level) / 2)
+
+  r <- model$predict_fn(model, patient, times = times)[1, ]
+  list(lower = 1 - (1 - r)^exp(-z * se_lp),
+       upper = 1 - (1 - r)^exp( z * se_lp),
+       se_lp = se_lp)
+}
 
 # ── 5.  UI ────────────────────────────────────────────────────────────────────
 # page_sidebar() gives a fixed left sidebar and a scrollable main area.
@@ -246,7 +262,7 @@ attribute_risk <- function(model, patient, time = 10) {
 # as input$<inputId>.
 
 ui <- page_sidebar(
-  title = "MALO Risk Calculator - SLD At-Risk, Low Fibrosis Burden",
+  title = "Major Adverse Liver Outcomes (MALO) Risk Calculator: Early At-Risk SLD with Low Fibrosis Burden",
   theme = bs_theme(bootswatch = "flatly"),
 
   # ── Left sidebar: input controls ──────────────────────────────────────────
@@ -420,16 +436,14 @@ server <- function(input, output, session) {
     risk_10 <- 100 * risk[1, "risk_10y"]
     ratio_10 <- round(risk_10 / RISK_THRESHOLD_10Y, 1)
 
-    # ── 6d. Attribute the risk across the six predictors ─────────────────────
+    # 95% CI (coefficient uncertainty only — see risk_ci() in section 4b)
+    ci    <- risk_ci(model, patient, times = c(5, 10))
+    ci_5  <- 100 * ci$lower[["risk_5y"]];  ci_5u  <- 100 * ci$upper[["risk_5y"]]
+    ci_10 <- 100 * ci$lower[["risk_10y"]]; ci_10u <- 100 * ci$upper[["risk_10y"]]
+
+    # ── 6d. Attribute the risk across the four modifiable predictors ─────────
     contrib <- attribute_risk(model, patient, time = 10)
     contrib <- contrib[order(-abs(contrib$delta_pp)), ]
-
-    # Principal modifiable driver: the modifiable factor carrying the most
-    # absolute risk relative to its clinical target.  A patient already at or
-    # better than target on all four has no positive delta — say so rather than
-    # naming whichever factor happens to be least negative.
-    mod <- contrib[contrib$modifiable, ]
-    top <- if (any(mod$delta_pp > 0)) mod[which.max(mod$delta_pp), ] else NULL
 
     # ── 6e. Out-of-range notice ──────────────────────────────────────────────
     # model$input_range holds the training 1st–99th percentiles.  Inputs outside
@@ -449,11 +463,8 @@ server <- function(input, output, session) {
       notes <- c(notes, sprintf("Alcohol intake %g g/week was capped at %g g/week before prediction.",
                                 patient$alcohol_grams_week, model$preprocessing$alcohol_cap))
 
-    # ── 6f. Risk category and recommendation ─────────────────────────────────
+    # ── 6f. Surveillance recommendation ──────────────────────────────────────
     high_risk     <- risk_10 >= RISK_THRESHOLD_10Y
-    risk_category <- if (high_risk) "High Risk" else "Low Risk"
-    threshold_txt <- paste0(if (high_risk) "≥ " else "< ", fmt_pct(RISK_THRESHOLD_10Y))
-    card_colour   <- if (high_risk) "danger" else "success"
     surveillance  <- if (high_risk) {
       "Repeat FIB-4 assessment every 1–2 years (intensified surveillance)"
     } else {
@@ -475,111 +486,74 @@ server <- function(input, output, session) {
           tags$ul(class = "mb-0", lapply(notes, tags$li))
         ),
 
-        layout_columns(
-          col_widths = c(5, 7),
-
-          # ── Card 1: predicted risk numbers ──────────────────────────────
-          card(
-            height = "100%",
-            card_header(
-              class = "fw-semibold",
-              "Predicted Risk of Major Adverse Liver Outcomes"
-            ),
-            card_body(
-              tags$table(
-                class = "table table-sm table-borderless mb-0",
-                tags$tbody(
-                  tags$tr(
-                    tags$th("5-year risk:"),
-                    tags$td(strong(fmt_pct(risk_5)))
-                  ),
-                  tags$tr(
-                    tags$th("10-year risk:"),
-                    tags$td(strong(fmt_pct(risk_10)))
-                  )
-                )
-              ),
-              p(
-                class = "mt-2 mb-0 text-muted",
-                style = "font-size: 0.9em;",
-                sprintf("This patient's risk is %sx the surveillance threshold (%s at 10 years).",
-                        ratio_10, fmt_pct(RISK_THRESHOLD_10Y))
-              )
-            )
+        # ── Card 1: predicted risk (with CI) and surveillance recommendation ─
+        card(
+          card_header(
+            class = "fw-semibold",
+            "Predicted Risk of Major Adverse Liver Outcomes"
           ),
-
-          # ── Card 2: risk category + principal modifiable driver ──────────
-          card(
-            height = "100%",
-            card_header(
-              class = paste0("bg-", card_colour, " text-white fw-semibold"),
-              paste0("Risk Category: ", risk_category,
-                     "  (10-year risk ", threshold_txt, ")")
+          card_body(
+            tags$table(
+              class = "table table-sm table-borderless mb-0",
+              tags$tbody(
+                tags$tr(
+                  tags$th("5-year risk:"),
+                  tags$td(strong(fmt_pct(risk_5)),
+                          tags$span(class = "text-muted",
+                                    sprintf(" (95%% CI %s\u2013%s)",
+                                            fmt_pct(ci_5), fmt_pct(ci_5u))))
+                ),
+                tags$tr(
+                  tags$th("10-year risk:"),
+                  tags$td(strong(fmt_pct(risk_10)),
+                          tags$span(class = "text-muted",
+                                    sprintf(" (95%% CI %s\u2013%s)",
+                                            fmt_pct(ci_10), fmt_pct(ci_10u))))
+                )
+              )
             ),
-            card_body(
-              if (is.null(top)) {
-                p(
-                  strong("Principal Modifiable Risk Factor: "), "none — ",
-                  "this patient is already at or better than target on BMI, ",
-                  "diabetes status, alcohol intake and smoking. The remaining ",
-                  "risk is driven by age and sex."
-                )
-              } else {
-                tagList(
-                  p(
-                    strong("Principal Modifiable Risk Factor: "), top$label,
-                    sprintf(" (%s)", top$value)
-                  ),
-                  p(
-                    class = "mb-0",
-                    sprintf(
-                      "It multiplies this patient's 10-year risk by %.2f. %s is projected to lower that risk from %s to %s (%s percentage points).",
-                      top$multiple, ACTION_PHRASE[[top$var]],
-                      fmt_pct(risk_10), fmt_pct(top$risk_if_ref),
-                      fmt_pct(-top$delta_pp, suffix = "")
-                    )
-                  )
-                )
-              },
-              hr(class = "my-2"),
-              p(class = "mb-0", strong("Recommendation: "), surveillance)
-            )
+            p(
+              class = "mt-2 mb-0 text-muted",
+              style = "font-size: 0.9em;",
+              sprintf("This patient's risk is %sx the surveillance threshold (%s at 10 years).",
+                      ratio_10, fmt_pct(RISK_THRESHOLD_10Y))
+            ),
+            p(
+              class = "mt-1 mb-0 text-muted",
+              style = "font-size: 0.8em;",
+              "95% CI reflects sampling uncertainty in the model coefficients; ",
+              "uncertainty in the baseline hazard is not included."
+            ),
+            hr(class = "my-2"),
+            p(class = "mb-0", strong("Recommendation: "), surveillance)
           )
-        ), # end layout_columns
+        ),
 
-        # ── Card 3: full contribution breakdown ──────────────────────────────
+        # ── Card 2: modifiable-factor contribution breakdown ─────────────────
         card(
           class = "mt-3",
-          card_header(class = "fw-semibold", "Risk Factor Contributions"),
+          card_header(class = "fw-semibold", "Modifiable Risk Factor Contributions"),
           card_body(
             p(
               class = "text-muted mb-2",
               style = "font-size: 0.9em;",
-              "Each factor is compared with a reference patient: ", REFERENCE_TEXT,
-              sprintf(" (10-year risk %s).",
-                      fmt_pct(100 * model$predict_fn(
-                        model, as.data.frame(REFERENCE, stringsAsFactors = FALSE),
-                        times = 10)[, 1]))
+              "Each modifiable factor is compared with the same patient at an optimal profile (BMI 25, no diabetes, no alcohol, non-smoking); age and sex are held at the patient's own values."
             ),
             tags$table(
               class = "table table-sm align-middle mb-2",
               tags$thead(tags$tr(
                 tags$th("Factor"),
                 tags$th("Patient"),
-                tags$th("Reference"),
+                tags$th("Optimal"),
                 tags$th(class = "text-end", "Risk multiple"),
                 tags$th(class = "text-end", "Δ 10-year risk")
               )),
               tags$tbody(lapply(seq_len(nrow(contrib)), function(i) {
                 row <- contrib[i, ]
                 tags$tr(
-                  tags$td(row$label,
-                          if (!row$modifiable)
-                            tags$span(class = "text-muted",
-                                      style = "font-size: 0.85em;",
-                                      " (not modifiable)")),
+                  tags$td(row$label),
                   tags$td(row$value),
-                  tags$td(class = "text-muted", row$ref_value),
+                  tags$td(class = "text-muted", row$opt_value),
                   tags$td(class = "text-end", sprintf("×%.2f", row$multiple)),
                   tags$td(
                     class = paste("text-end",
@@ -596,10 +570,10 @@ server <- function(input, output, session) {
               style = "font-size: 0.85em;",
               tags$strong("Reading this table. "),
               "Risk multiples are exact and multiply together: their product is ",
-              sprintf("this patient's total risk multiple versus the reference patient (×%.2f). ",
+              sprintf("this patient's total risk multiple versus the same patient at the optimal profile (×%.2f). ",
                       prod(contrib$multiple)),
               "Δ 10-year risk is the absolute risk attributable to that factor, ",
-              "holding the other five fixed; because absolute risk is a nonlinear ",
+              "holding the other factors fixed; because absolute risk is a nonlinear ",
               "function of the linear predictor, the Δ column does not sum to the total. ",
               "These are model counterfactuals, not estimates of treatment effect.",
               if (any(grepl("†", contrib$value, fixed = TRUE)))
@@ -619,7 +593,8 @@ server <- function(input, output, session) {
             tags$ul(
               class = "mb-0",
               style = "font-size: 0.9em;",
-              tags$li(model$model_name),
+              # Drop the internal "BFA" project prefix and re-capitalise the first word.
+              tags$li(sub("^(.)", "\\U\\1", sub("^BFA\\s+", "", model$model_name), perl = TRUE)),
               tags$li(sprintf("Fine-Gray subdistribution hazard model; %s", model$equation)),
               tags$li(sprintf(
                 "Fitted on %s participants (%s MALO events, %s non-liver deaths; median follow-up %.1f years).",

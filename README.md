@@ -87,11 +87,10 @@ An interactive risk calculator hosted as a Shiny web app.
 
 ### Outputs
 
-- **Predicted MALO risk** at 5 and 10 years (cumulative incidence from the competing-risks Fine-Gray model)
+- **Predicted MALO risk** at 5 and 10 years (cumulative incidence from the competing-risks Fine-Gray model), each with a 95% confidence interval that reflects uncertainty in the model coefficients (baseline-hazard uncertainty is not included)
 - **Threshold comparison:** fold-difference relative to the 0.5% at 10 years surveillance threshold
-- **Risk category** (High ≥ 0.5% / Low < 0.5%) with suggested surveillance interval
-- **Principal modifiable risk factor**, with the absolute risk reduction that reaching its clinical target would achieve
-- **Risk factor contributions** table covering all six predictors, against a fixed reference patient
+- **Recommendation:** suggested surveillance interval (10-year risk ≥ 0.5% → every 1–2 years; < 0.5% → every 3 years), shown in the predicted-risk panel
+- **Modifiable risk factor contributions** table covering BMI, type 2 diabetes, alcohol and smoking, each compared with the same patient at an optimal profile (BMI 25, no diabetes, no alcohol, non-smoking); age and sex are held at the patient's own values
 - **Range warnings** when an input falls outside the training 1st–99th percentiles or is winsorised/capped before prediction
 
 ### Technical notes
@@ -104,12 +103,15 @@ An interactive risk calculator hosted as a Shiny web app.
 - Risk is the closed-form `CIF(t | x) = 1 - exp(-H0(t) * exp(sum(beta * x)))`, evaluated by the
   `predict_fn` shipped inside the `.rds`, so the app never reimplements the training transforms.
 - **Attribution replaces SHAP.** Because the model is linear in the log-subdistribution-hazard,
-  moving predictor *j* to a reference value multiplies risk by exactly `exp(beta_j * (x_j - ref_j))`,
-  independently of the other predictors. For each factor the app reports that exact multiple
-  (these multiply to the patient's total risk multiple versus the reference patient) and the
-  absolute percentage points of 10-year risk attributable to it. The principal modifiable factor
-  is the one carrying the most absolute risk relative to its clinical target. Reference patient:
-  55-year-old man, BMI 25 kg/m², no type 2 diabetes, no alcohol, non-smoker.
+  moving modifiable predictor *j* to its optimal value multiplies risk by exactly
+  `exp(beta_j * (x_j - opt_j))`, independently of the other predictors. For each modifiable factor
+  the app reports that exact multiple (these multiply to the patient's total risk multiple versus
+  the same patient at the optimal profile) and the absolute percentage points of 10-year risk
+  attributable to it.
+- **Confidence intervals** use the coefficient covariance matrix stored in the model (`vcov`):
+  `se(lp) = sqrt(x' V x)`, then `1 - (1 - risk)^exp(±1.96 * se(lp))`. The baseline cumulative
+  hazard is a point estimate without a variance (`cmprsk::crr` does not return one), so its
+  uncertainty is not propagated.
 - Alcohol values above 500 g/week are capped and BMI is winsorised to the training bounds, by the
   model's own `predict_fn`; the UI flags when this has happened.
 - Dependencies are `shiny` and `bslib` only. Prediction is closed-form and instantaneous, so the
