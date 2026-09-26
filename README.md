@@ -1,6 +1,6 @@
 # MALO Risk Calculator
 
-Individualized prediction of **major adverse liver outcomes (MALO)** in at-risk steatotic liver disease (SLD) patients with low fibrosis burden, using a competing-risks Fine-Gray model trained on UK Biobank data.
+Individualized prediction of **major adverse liver outcomes (MALO)** in at-risk steatotic liver disease (SLD) patients with low fibrosis burden, using a competing-risks Fine-Gray model trained on UK Biobank data. The calculator returns each patient's absolute 5-year and 10-year MALO risk.
 
 ---
 
@@ -76,22 +76,36 @@ An interactive risk calculator hosted as a Shiny web app.
 
 ### Inputs
 
-| Variable | Details |
-|---|---|
-| Age | years |
-| Sex | Male / Female |
-| BMI | kg/m² |
-| Type 2 diabetes | Yes / No |
-| Alcohol intake | Standard drinks/week **or** grams/week (toggle between modes) |
-| Smoking status | Current / Non-current |
+| Variable | Details | Applied to the model as |
+|---|---|---|
+| Age | years (18–100 accepted) | Clamped to 41–69 years |
+| Sex | Male / Female | — |
+| BMI | kg/m² (10–70 accepted) | Clamped to ≤ 44.7 and **floored at 25** (see below) |
+| Type 2 diabetes | Yes / No | — |
+| Alcohol intake | Standard drinks/week **or** grams/week (toggle between modes; 1 drink ≈ 14 g) | Clamped to 0–500 g/week |
+| Smoking status | Current / Non-current | — |
+
+### Input policy
+
+The Fine-Gray model is linear in age, BMI and alcohol, so extrapolating beyond the range of the training data is unreliable. Every continuous input is therefore **clamped to the bounds observed in training** and the prediction is made from the clamped value; the app never extrapolates. The clamp is applied once, before anything else, so the headline risk, its confidence interval and the contributions table all use the same values.
+
+| Input | Bounds | Source |
+|---|---|---|
+| Age | 41–69 years | Training 1st–99th percentiles |
+| BMI (upper) | 44.7 kg/m² | Training 99th percentile |
+| Alcohol | 0–500 g/week | Fixed cap |
+
+**BMI floor at 25.** BMI is a linear term, so left alone a lower BMI would be read as protective (BMI 20 vs 25 would lower risk by ~29%). Lean SLD is not low-risk, so BMI is floored at 25 in the linear predictor. This applies to the predicted risk itself, not only to the contributions table. A patient with BMI ≤ 25 is treated as **on target** for BMI: risk multiple ×1.00 and Δ 10-year risk 0%. The floor supersedes the lower BMI clamp, so a low BMI is reported as floored rather than clamped.
+
+Clamped values are flagged in the app: an alert above the results lists each clamped input and the value actually used, the contributions table marks the value with † (clamped) or ‡ (BMI floored at 25, so at target).
 
 ### Outputs
 
 - **Predicted MALO risk** at 5 and 10 years (cumulative incidence from the competing-risks Fine-Gray model), each with a 95% confidence interval that reflects uncertainty in the model coefficients (baseline-hazard uncertainty is not included)
 - **Threshold comparison:** fold-difference relative to the 0.5% at 10 years surveillance threshold
 - **Recommendation:** suggested surveillance interval (10-year risk ≥ 0.5% → every 1–2 years; < 0.5% → every 3 years), shown in the predicted-risk panel
-- **Modifiable risk factor contributions** table covering BMI, type 2 diabetes, alcohol and smoking, each compared with the same patient at an optimal profile (BMI 25, no diabetes, no alcohol, non-smoking); age and sex are held at the patient's own values
-- **Range warnings** when an input falls outside the training 1st–99th percentiles or is winsorised/capped before prediction
+- **Modifiable risk factor contributions** table covering BMI, type 2 diabetes, alcohol and smoking, each compared with the same patient at an optimal profile (BMI 25, no diabetes, no alcohol, non-smoking); age and sex are held at the patient's own values. A factor already at its optimal value (including any BMI ≤ 25) shows ×1.00 and 0%
+- **Clamping notices** when age, BMI or alcohol was clamped to the training bounds before prediction
 
 ### Technical notes
 
@@ -112,8 +126,12 @@ An interactive risk calculator hosted as a Shiny web app.
   `se(lp) = sqrt(x' V x)`, then `1 - (1 - risk)^exp(±1.96 * se(lp))`. The baseline cumulative
   hazard is a point estimate without a variance (`cmprsk::crr` does not return one), so its
   uncertainty is not propagated.
-- Alcohol values above 500 g/week are capped and BMI is winsorised to the training bounds, by the
-  model's own `predict_fn`; the UI flags when this has happened.
+- **Input policy.** `prepare_inputs()` in `app.R` clamps age, BMI and alcohol to the training bounds
+  (read from `input_range`, `preprocessing$bmi_winsor` and `preprocessing$alcohol_cap` in the model
+  file) and floors BMI at `BMI_FLOOR <- 25` *before* calling `predict_fn`, because `predict_fn` does
+  not clamp age and cannot floor BMI. The fitted model is unchanged. `BMI_FLOOR` must equal
+  `OPTIMAL$bmi` so that the BMI counterfactual is exactly ×1. The UI flags any clamped or floored
+  value.
 - Dependencies are `shiny` and `bslib` only. Prediction is closed-form and instantaneous, so the
   progress bar and button-locking of the RSF version are gone.
 
