@@ -66,9 +66,10 @@ library(bslib)
 #   $cohort_summary, $cv_performance   aggregate metadata shown in the footer
 #   $predict_fn    function    CIF(t|x) = 1 - exp(-H0(t) * exp(x %*% beta))
 #
-# $predict_fn does its own preprocessing (BMI winsorising, alcohol capping,
-# factor coercion), so the app passes raw user input straight through and never
-# reimplements the training transforms.
+# $predict_fn does its own factor coercion, BMI winsorising and alcohol capping,
+# but it does NOT clamp age and cannot floor BMI, so the app applies the input
+# policy in section 3b (prepare_inputs) *before* calling it.  The fitted model
+# object itself is unchanged.
 MODEL_PATH <- "model/FG_clinical_model_deploy.rds"
 if (!file.exists(MODEL_PATH))
   stop("Model file not found: ", normalizePath(MODEL_PATH, mustWork = FALSE))
@@ -86,12 +87,18 @@ message("Loaded ", model$model_name, " (created ", model$date_created, ")")
 # below to 100 * model$risk_cut_10y to switch to the cohort median instead.
 RISK_THRESHOLD_10Y <- 0.5
 
+# BMI is a linear term in the model, so a BMI below 25 would lower the predicted
+# risk (BMI 20 vs 25: x0.71).  Lean SLD is not low-risk, so BMI is floored at
+# this value in the linear predictor; patients at or below it are "at target".
+# This must equal OPTIMAL$bmi below so that the BMI counterfactual is exactly x1.
+BMI_FLOOR <- 25
+
 # Optimal profile for the modifiable factors.  Each modifiable factor's
 # contribution is measured by moving it to its value here while the patient's
 # other factors — including age and sex, which are not modifiable and are held
 # at the patient's own values — stay where they are.
 OPTIMAL <- list(
-  bmi                = 25,
+  bmi                = BMI_FLOOR,
   has_t2dm           = "0",
   alcohol_grams_week = 0,
   smoking_binary     = "0"
@@ -125,6 +132,43 @@ fmt_value <- function(var, x) {
 fmt_pct <- function(x, suffix = "%") {
   if (is.na(x)) return("—")
   paste0(sprintf(if (x == 0) "%.2f" else if (abs(x) < 0.1) "%.3f" else "%.2f", x), suffix)
+}
+
+
+# ── 3b.  Input policy: clamp to observed bounds, floor BMI ────────────────────
+#
+# One policy for every continuous input (age, BMI, alcohol): clamp to the bounds
+# observed in training and predict from the clamped value, never extrapolate.
+#   age      model$input_range$age            (training 1st–99th percentiles)
+#   bmi      model$preprocessing$bmi_winsor   (training 1st–99th percentiles)
+#   alcohol  0 … model$preprocessing$alcohol_cap
+# The single exception is BMI, which is then floored at BMI_FLOOR (see above).
+#
+# This is applied once per prediction, before anything else touches the patient,
+# so the risk, its CI and the counterfactual table all use the same values.
+# Returns the prepared patient plus what was done, for the notes and table.
+prepare_inputs <- function(model, patient) {
+  bounds <- list(
+    age                = model$input_range$age,
+    bmi                = unname(model$preprocessing$bmi_winsor),
+    alcohol_grams_week = c(0, model$preprocessing$alcohol_cap)
+  )
+  out     <- patient[1L, , drop = FALSE]
+  clamped <- setNames(rep(FALSE, length(bounds)), names(bounds))
+  for (v in names(bounds)) {
+    raw       <- as.numeric(patient[[v]][1])
+    out[[v]]  <- min(max(raw, bounds[[v]][1]), bounds[[v]][2])
+    clamped[v] <- out[[v]] != raw
+  }
+
+  # BMI: the floor supersedes the lower clamp (both bounds sit below it), so
+  # only report an upper-bound clamp; a low BMI is reported as floored instead.
+  floored <- out$bmi < BMI_FLOOR
+  out$bmi <- max(out$bmi, BMI_FLOOR)
+  clamped[["bmi"]] <- as.numeric(patient$bmi[1]) > bounds$bmi[2]
+
+  list(patient = out, raw = patient[1L, , drop = FALSE],
+       clamped = clamped, bounds = bounds, bmi_floored = floored)
 }
 
 
@@ -162,31 +206,15 @@ fmt_pct <- function(x, suffix = "%") {
 # linear predictor), which is why the table below reports them alongside the
 # multiples rather than as a decomposition that sums to the total.
 #
-# Everything routes through model$predict_fn, so the app inherits the training
-# preprocessing (BMI winsorising, alcohol capping) for the counterfactual rows
-# as well as the patient row, and there is exactly one implementation of the
-# risk equation in the deployment.
-# Reproduce the clamping that model$predict_fn applies internally, so the UI can
-# display (and flag) the values the risk estimate is actually based on.
-effective_values <- function(model, patient) {
-  vals <- lapply(model$predictors, function(v) patient[[v]][1])
-  names(vals) <- model$predictors
-  adj <- setNames(as.list(rep(FALSE, length(vals))), names(vals))
-
-  bw <- model$preprocessing$bmi_winsor
-  clamped <- max(min(as.numeric(vals$bmi), bw[2]), bw[1])
-  adj$bmi  <- !isTRUE(all.equal(clamped, as.numeric(vals$bmi)))
-  vals$bmi <- clamped
-
-  capped <- min(as.numeric(vals$alcohol_grams_week), model$preprocessing$alcohol_cap)
-  adj$alcohol_grams_week  <- !isTRUE(all.equal(capped, as.numeric(vals$alcohol_grams_week)))
-  vals$alcohol_grams_week <- capped
-
-  list(values = vals, adjusted = adj)
-}
-
-attribute_risk <- function(model, patient, time = 10) {
-  preds <- MODIFIABLE
+# Everything routes through model$predict_fn, so there is exactly one
+# implementation of the risk equation in the deployment.  `prep` is the output
+# of prepare_inputs(): the patient row and the counterfactual rows all start
+# from the already-clamped, BMI-floored values.  Because the floored BMI equals
+# OPTIMAL$bmi for any patient at or below 25, that row's multiple is exactly x1
+# and its delta exactly 0 ("at target").
+attribute_risk <- function(model, prep, time = 10) {
+  patient <- prep$patient
+  preds   <- MODIFIABLE
 
   # Row 1 is the patient; rows 2..5 are the patient with a single modifiable
   # predictor moved to its optimal value.  One predict_fn call covers all of them.
@@ -198,17 +226,20 @@ attribute_risk <- function(model, patient, time = 10) {
   r_ref <- setNames(r[-1], preds)
 
   # The table must show the value the model actually used, not the raw input:
-  # predict_fn winsorises BMI and caps alcohol, so a raw 900 g/week sits next to
-  # a multiple computed at 500 g/week unless we substitute the effective value.
-  eff <- effective_values(model, patient)
+  # a raw 900 g/week would sit next to a multiple computed at 500 g/week.  The
+  # exception is a floored BMI, where the entered value is shown (the patient is
+  # at target) and marked with a double dagger.
+  show_value <- function(v) {
+    if (v == "bmi" && prep$bmi_floored)
+      return(paste0(fmt_value(v, prep$raw$bmi), "\u2021"))
+    txt <- fmt_value(v, patient[[v]][1])
+    if (isTRUE(unname(prep$clamped[v]))) paste0(txt, "\u2020") else txt
+  }
 
   data.frame(
     var       = preds,
     label     = unname(VAR_LABELS[preds]),
-    value     = vapply(preds, function(v) {
-                  txt <- fmt_value(v, eff$values[[v]])
-                  if (isTRUE(eff$adjusted[[v]])) paste0(txt, "\u2020") else txt
-                }, character(1)),
+    value     = vapply(preds, show_value, character(1)),
     opt_value = vapply(preds, function(v) fmt_value(v, OPTIMAL[[v]]), character(1)),
     # exp(beta_j * (x_j - opt_j)); > 1 raises risk, < 1 lowers it
     multiple  = log1p(-r_pat) / log1p(-r_ref),
@@ -234,11 +265,10 @@ attribute_risk <- function(model, patient, time = 10) {
 # events H0 is estimated far more tightly than the coefficients, so this is a
 # small omission, but the interval is best read as a slightly optimistic one.
 # Nor does it capture model misspecification or performance in other cohorts.
+#
+# `patient` must already have passed through prepare_inputs().
 risk_ci <- function(model, patient, times = c(5, 10), level = 0.95) {
-  eff <- effective_values(model, patient)$values
-  nd  <- patient[1L, , drop = FALSE]
-  nd$bmi                <- eff$bmi
-  nd$alcohol_grams_week <- eff$alcohol_grams_week
+  nd <- patient[1L, , drop = FALSE]
   for (v in names(model$xlevels))
     nd[[v]] <- factor(as.character(nd[[v]]), levels = model$xlevels[[v]])
 
@@ -356,8 +386,8 @@ ui <- page_sidebar(
     class = "mt-4 pt-3 border-top text-muted",
     style = "font-size: 0.85em;",
     tags$em(
-      "For use in at-risk SLD patients with low fibrosis burden (FIB-4 < 2.67) after exclusion",
-      "of competing liver disease. This tool is intended to individualize fibrosis surveillance",
+      "For use in at-risk SLD patients in whom advanced fibrosis has been excluded (FIB-4 <2.67)",
+      "and after exclusion of competing liver disease. Intended to individualize fibrosis surveillance",
       "intervals within the existing guideline framework. Not validated for use outside this population."
     )
   )
@@ -409,8 +439,8 @@ server <- function(input, output, session) {
     #   smoking_binary: "0" = never/previous, "1" = current
     #   alcohol_grams_week: numeric g/week
     # model$predict_fn coerces these character codes to the trained factor
-    # levels itself, winsorises BMI to the training bounds and caps alcohol, so
-    # the raw values go through unmodified here.
+    # levels itself.  Continuous inputs are clamped and BMI floored by
+    # prepare_inputs() just below (section 3b).
     alcohol_g <- if (input$alcohol_mode == "drinks") {
       as.numeric(input$alcohol_drinks) * 14
     } else {
@@ -427,6 +457,11 @@ server <- function(input, output, session) {
       stringsAsFactors   = FALSE
     )
 
+    # Apply the input policy once; everything downstream uses `patient`
+    # (clamped, BMI-floored).  `prep` keeps the raw values and what was changed.
+    prep    <- prepare_inputs(model, patient)
+    patient <- prep$patient
+
     # ── 6c. Predict cumulative incidence at 5 and 10 years ────────────────────
     # predict_fn returns a 1-row matrix with columns risk_5y and risk_10y, on
     # the probability scale.  H0(t) is tabulated on a 0.05-year grid on which
@@ -442,26 +477,23 @@ server <- function(input, output, session) {
     ci_10 <- 100 * ci$lower[["risk_10y"]]; ci_10u <- 100 * ci$upper[["risk_10y"]]
 
     # ── 6d. Attribute the risk across the four modifiable predictors ─────────
-    contrib <- attribute_risk(model, patient, time = 10)
+    contrib <- attribute_risk(model, prep, time = 10)
     contrib <- contrib[order(-abs(contrib$delta_pp)), ]
 
-    # ── 6e. Out-of-range notice ──────────────────────────────────────────────
-    # model$input_range holds the training 1st–99th percentiles.  Inputs outside
-    # them are extrapolation (or, for BMI and alcohol, are actively winsorised
-    # by predict_fn), so the estimate deserves a caveat.
-    rng   <- model$input_range
+    # ── 6e. Clamping notice ──────────────────────────────────────────────────
+    # Inputs outside the training bounds are clamped (never extrapolated), so
+    # say which values the estimate is actually based on.
     notes <- character(0)
-    if (patient$age < rng$age[1] || patient$age > rng$age[2])
-      notes <- c(notes, sprintf("Age %g is outside the training range (%g–%g years); the estimate is an extrapolation.",
-                                patient$age, rng$age[1], rng$age[2]))
-    if (patient$bmi < model$preprocessing$bmi_winsor[1] ||
-        patient$bmi > model$preprocessing$bmi_winsor[2])
-      notes <- c(notes, sprintf("BMI %g was winsorised to the training bounds (%.1f–%.1f kg/m²) before prediction.",
-                                patient$bmi, model$preprocessing$bmi_winsor[1],
-                                model$preprocessing$bmi_winsor[2]))
-    if (patient$alcohol_grams_week > model$preprocessing$alcohol_cap)
+    if (prep$clamped[["age"]])
+      notes <- c(notes, sprintf("Age %g is outside the training range (%g–%g years); the estimate uses %g and is not extrapolated.",
+                                prep$raw$age, prep$bounds$age[1], prep$bounds$age[2],
+                                patient$age))
+    if (prep$clamped[["bmi"]])
+      notes <- c(notes, sprintf("BMI %g is above the training range; the estimate uses %.1f kg/m² and is not extrapolated.",
+                                prep$raw$bmi, patient$bmi))
+    if (prep$clamped[["alcohol_grams_week"]])
       notes <- c(notes, sprintf("Alcohol intake %g g/week was capped at %g g/week before prediction.",
-                                patient$alcohol_grams_week, model$preprocessing$alcohol_cap))
+                                prep$raw$alcohol_grams_week, patient$alcohol_grams_week))
 
     # ── 6f. Surveillance recommendation ──────────────────────────────────────
     high_risk     <- risk_10 >= RISK_THRESHOLD_10Y
@@ -579,7 +611,11 @@ server <- function(input, output, session) {
               if (any(grepl("†", contrib$value, fixed = TRUE)))
                 tagList(tags$br(),
                         "† Value clamped to the training bounds before prediction; ",
-                        "the risk estimate uses the clamped value shown here.")
+                        "the risk estimate uses the clamped value shown here."),
+              if (any(grepl("\u2021", contrib$value, fixed = TRUE)))
+                tagList(tags$br(),
+                        "\u2021 BMI at or below 25 is floored at 25 in the model, so this patient ",
+                        "is at target (\u00d71.00, \u0394 0%).")
             )
           )
         ),
@@ -607,6 +643,7 @@ server <- function(input, output, session) {
                 model$cv_performance$mean_cindex,
                 model$cv_performance$mean_auc_t5,
                 model$cv_performance$mean_auc_t10)),
+              tags$li("BMI is floored at 25 to avoid treating low BMI as protective."),
               tags$li(sprintf("Model exported %s under R %s.",
                               model$date_created, model$r_version))
             )
