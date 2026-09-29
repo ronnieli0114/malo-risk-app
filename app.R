@@ -87,6 +87,16 @@ message("Loaded ", model$model_name, " (created ", model$date_created, ")")
 # below to 100 * model$risk_cut_10y to switch to the cohort median instead.
 RISK_THRESHOLD_10Y <- 0.5
 
+# Alcohol-assessment banner thresholds (g/week), independent of the model.
+# NOT a surveillance override: a sex*alcohol interaction was tested as a
+# sensitivity analysis (src/07_sex_alcohol_interaction.R) and did not support
+# raising risk more steeply in women, so the model and its recommendation are
+# unchanged. These thresholds match has_excess_alcohol in
+# src/01_preprocess_clean_ukbb_cohort.R and simply flag a patient for a
+# clinical alcohol assessment; the calculated risk and the surveillance
+# recommendation below are always the model's, never overridden by this flag.
+ALCOHOL_ASSESSMENT_CUT <- c(Male = 210, Female = 140)
+
 # BMI is a linear term in the model, so a BMI below 25 would lower the predicted
 # risk (BMI 20 vs 25: x0.71).  Lean SLD is not low-risk, so BMI is floored at
 # this value in the linear predictor; patients at or below it are "at target".
@@ -295,6 +305,43 @@ ui <- page_sidebar(
   title = "Major Adverse Liver Outcomes (MALO) Risk Calculator: Early At-Risk SLD with Low Fibrosis Burden",
   theme = bs_theme(bootswatch = "flatly"),
 
+  # page_sidebar() always wraps the page in bslib's page_fillable(), which
+  # pins html/body to exactly one screen's height regardless of this
+  # `fillable` argument (that argument only affects the main content area's
+  # internal flex behavior, per bslib's own source) -- so the sidebar-layout
+  # grid inherits a fixed height and its main panel (div.main) scrolls inside
+  # its own cramped little box the moment results don't fit. fillable = FALSE
+  # turns off the fill-item flex treatment on the main panel (a smaller
+  # improvement); the CSS overrides below (in tags$head) do the rest, letting
+  # the main panel grow to its natural content height so the page itself gets
+  # longer and scrolls normally. The sidebar keeps its own width/behavior.
+  fillable = FALSE,
+
+  # Extra vertical breathing room in the MAIN panel only (the sidebar is left
+  # alone). bslib's "flatly" theme is fairly compact by default, which crowds
+  # the risk numbers, the contributions table and the "About this model"
+  # accordion together on taller/wider screens. This loosens spacing between
+  # and inside those blocks without changing the sidebar's layout.
+  tags$head(tags$style(HTML("
+    /* Let the page grow to its content's natural height and scroll normally,
+       instead of bslib's page_fillable() pinning it to one screen and making
+       div.main scroll inside its own short internal box. The sidebar's own
+       column/width is untouched by any of this. */
+    html, body.bslib-page-sidebar          { height: auto !important; min-height: 100vh !important; overflow-y: visible !important; }
+    main.bslib-page-main                   { height: auto !important; }
+    .bslib-sidebar-layout                  { height: auto !important; }
+    .bslib-sidebar-layout > .main          { height: auto !important; max-height: none !important; overflow-y: visible !important; }
+
+    #results_ui .card       { margin-bottom: 1.75rem !important; }
+    #results_ui .card-body  { padding: 1.5rem 1.75rem !important; }
+    #results_ui .card-body table.table td,
+    #results_ui .card-body table.table th { padding-top: .6rem !important; padding-bottom: .6rem !important; }
+    #results_ui hr          { margin-top: 1.5rem !important; margin-bottom: 1.5rem !important; }
+    #results_ui .alert      { padding: 1rem 1.25rem !important; margin-bottom: 1.5rem !important; }
+    #results_ui .accordion  { margin-top: 1.75rem !important; }
+    #results_ui p           { margin-bottom: .75rem !important; }
+  "))),
+
   # ── Left sidebar: input controls ──────────────────────────────────────────
   sidebar = sidebar(
     width = 310,
@@ -447,6 +494,12 @@ server <- function(input, output, session) {
       as.numeric(input$alcohol_grams)
     }
 
+    # Alcohol-assessment banner: evaluated on the raw reported intake (not the
+    # clamped value predict_fn uses), so it reflects what the patient actually
+    # reported. This only ever adds a banner; it never changes `patient`,
+    # `risk`, or the surveillance recommendation computed below.
+    alcohol_assessment_flag <- alcohol_g > ALCOHOL_ASSESSMENT_CUT[[input$sex]]
+
     patient <- data.frame(
       age                = as.numeric(input$age),
       sex                = if (input$sex == "Male") "1" else "2",
@@ -511,6 +564,28 @@ server <- function(input, output, session) {
       tagList(
 
         hr(),
+
+        # ── Alcohol-assessment banner ─────────────────────────────────────────
+        # A flag, not a surveillance override: the recommendation below is
+        # always the model's own, computed from the continuous risk. See
+        # ALCOHOL_ASSESSMENT_CUT above and src/07_sex_alcohol_interaction.R.
+        if (isTRUE(alcohol_assessment_flag)) div(
+          class = "alert alert-danger",
+          strong("⚠ Alcohol assessment recommended. "),
+          sprintf(
+            "Reported intake (%s g/week) exceeds the level associated with alcohol-related harm for %s (>%s g/week).",
+            round(alcohol_g), tolower(input$sex), ALCOHOL_ASSESSMENT_CUT[[input$sex]]
+          ),
+          " This flag does not change the calculated risk or the surveillance recommendation below; ",
+          "it is a separate prompt to assess alcohol use clinically.",
+          if (!high_risk) tagList(
+            tags$br(),
+            tags$em(
+              "Despite this flag, this patient's calculated 10-year risk is below the surveillance ",
+              "threshold, so the recommendation below remains standard surveillance, based on the model."
+            )
+          )
+        ),
 
         if (length(notes) > 0) div(
           class = "alert alert-warning py-2",
@@ -644,6 +719,9 @@ server <- function(input, output, session) {
                 model$cv_performance$mean_auc_t5,
                 model$cv_performance$mean_auc_t10)),
               tags$li("BMI is floored at 25 to avoid treating low BMI as protective."),
+              tags$li(sprintf(
+                "An alcohol-assessment banner is shown above %s g/week (men) or %s g/week (women); it flags a patient for clinical alcohol assessment but does not change the calculated risk or recommendation.",
+                ALCOHOL_ASSESSMENT_CUT[["Male"]], ALCOHOL_ASSESSMENT_CUT[["Female"]])),
               tags$li(sprintf("Model exported %s under R %s.",
                               model$date_created, model$r_version))
             )

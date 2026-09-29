@@ -450,15 +450,21 @@ ggsave(file.path(plot_dir, "02.02_FG_risk_stratification.png"),
 # in on that range to see meaningful separation from "Treat None".
 #
 # Panel B benchmarks the model against the standard-of-care surveillance
-# decisions: refer a patient for fibrosis assessment if they have type 2
-# diabetes, if they have >= 2 cardiometabolic risk factors, or (the guideline
-# rule) if either holds. These are all-or-nothing decision rules rather than
-# risk scores, so they enter the DCA as 0/1 indicators and refer exactly the
-# same patients at every threshold. Their net benefit still declines with the
-# threshold (the false-positive weight pt/(1-pt) grows), but they cannot trade
+# decision: refer a patient for fibrosis assessment if they have type 2
+# diabetes OR >= 2 cardiometabolic risk factors (the composite guideline
+# rule). This is an all-or-nothing decision rule rather than a risk score, so
+# it enters the DCA as a single 0/1 indicator and refers exactly the same
+# patients at every threshold. Its net benefit still declines with the
+# threshold (the false-positive weight pt/(1-pt) grows), but it cannot trade
 # sensitivity for specificity as the threshold moves — which is the point of
 # the comparison: the model can tighten or loosen its referral rate to match
-# the threshold, the standard-of-care rules cannot.
+# the threshold, the standard-of-care rule cannot.
+#
+# NOTE: this previously plotted the T2DM-alone and CMRFs-alone components as
+# separate curves instead of the composite rule the guideline actually uses,
+# so the figure disagreed with the referral-burden table below (which already
+# used the composite "T2DM or two or more CMRFs" rule). Fixed to use the same
+# composite rule as that table, consistent throughout the Results.
 ###############################################################################
 cat("\n=== Section 3: Decision curve analysis ===\n")
 
@@ -471,25 +477,13 @@ for (t in eval_times) {
       time_to_event,
       status,
       `Fine-Gray (clinical)`        = .data[[paste0("fg_clin_", t)]],
-      `Type 2 diabetes`             = soc_t2dm,
-      `Two or more CMRFs`           = soc_cmrf2,
       `T2DM or two or more CMRFs`   = soc_guideline
     )
 
   thres <- thresholds[[as.character(t)]]
 
-  # dca_A <- dca(Surv(time_to_event, status == 1) ~ `Fine-Gray (clinical)`,
-  #              data = dca_dat, time = t, thresholds = thres)
-  # p_dca_A <- dca_A %>%
-  #   plot(smooth = TRUE) +
-  #   ggsci::scale_color_d3() +
-  #   labs(title = paste0("DCA at t = ", t, " years: Fine-Gray net benefit"),
-  #        x = "Threshold probability", y = "Net benefit") +
-  #   theme_bw(base_size = 8) +
-  #   theme(legend.position = "bottom")
-
   dca_B <- dca(Surv(time_to_event, status == 1) ~ `Fine-Gray (clinical)` +
-                 `Type 2 diabetes` + `Two or more CMRFs`,
+                 `T2DM or two or more CMRFs`,
                data = dca_dat, time = t, thresholds = thres)
   p_dca_B <- dca_B %>%
     plot(smooth = TRUE) +
@@ -499,15 +493,12 @@ for (t in eval_times) {
     theme_bw(base_size = 8) +
     theme(legend.position = "bottom")
 
-  # p_dca_combined <- wrap_plots(p_dca_A, p_dca_B, ncol = 2) +
-  #   plot_annotation(title = paste0("Decision Curve Analysis at t = ", t, " years"))
   p_dca_combined <- p_dca_B
-  
+
   fig_no <- 2 + match(t, eval_times)   # 02.03 (t = 5), 02.04 (t = 10)
   ggsave(file.path(plot_dir, sprintf("02.%02d_FG_DCA_t%d.png", fig_no, t)),
          p_dca_combined, width = 6, height = 4.5, dpi = 400, bg = "white")
 
-  # Panel B contains every curve shown in Panel A
   dca_tables[[as.character(t)]] <- as_tibble(dca_B) %>% mutate(eval_time = t)
 }
 tables[["06_DCA_net_benefit"]] <- bind_rows(dca_tables)
